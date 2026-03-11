@@ -28,6 +28,17 @@
 
 namespace transformer_engine {
 
+inline NVTEShape nvte_make_shape(const size_t *data, size_t ndim) {
+  return {data, ndim};
+}
+
+size_t typeToSize(const DType type);
+
+inline size_t get_buffer_size_bytes(size_t numel, DType dtype);
+
+std::string to_string(const DType type);
+std::string to_string(const NVTEScalingMode &type);
+
 inline size_t product(const std::vector<size_t> &shape, const size_t begin, const size_t end) {
   NVTE_CHECK(begin <= end && end <= shape.size(), "Attempted to access entries ", begin, " to ",
              end, " in a vector with ", shape.size(), " entries");
@@ -675,16 +686,15 @@ constexpr size_t scale_tensor_alignment_Y_rowwise = 128;
 constexpr size_t scale_tensor_alignment_X_colwise = 128;
 constexpr size_t scale_tensor_alignment_Y_colwise = 4;
 
-size_t typeToSize(const DType type);
+inline size_t get_buffer_size_bytes(size_t numel, DType dtype) {
+  return numel * typeToSize(dtype);
+}
 
 void CheckNoopTensor(const Tensor &t, const std::string &name);
 void CheckInputTensor(const Tensor &t, const std::string &name);
 void CheckOutputTensor(const Tensor &t, const std::string &name, bool allow_empty = false);
 
 bool is_fp8_dtype(const DType t);
-
-std::string to_string(const DType type);
-std::string to_string(const NVTEScalingMode &type);
 
 inline bool is_tensor_scaling(const NVTEScalingMode &mode) {
   return mode == NVTE_DELAYED_TENSOR_SCALING;

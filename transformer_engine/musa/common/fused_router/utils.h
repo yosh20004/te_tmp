@@ -23,24 +23,6 @@
 
 namespace transformer_engine {
 
-NVTEShape nvte_make_shape(const size_t *data, size_t ndim) {
-  NVTEShape ret;
-  if (ndim == 0) {
-    ret.ndim = 0;
-    return ret;
-  }
-  NVTE_CHECK(ndim <= sizeof(ret.data) / sizeof(ret.data[0]),
-             "Too many dims for NVTEShape (requested: ", ndim,
-             ", max: ", sizeof(ret.data) / sizeof(ret.data[0]), ")");
-  if (data == nullptr) {
-    std::fill(ret.data, ret.data + ndim, 0);
-  } else {
-    std::copy(data, data + ndim, ret.data);
-  }
-  ret.ndim = ndim;
-  return ret;
-}
-
 typedef void *NVTEGroupedTensor;
 
 struct GroupedTensor {
@@ -369,7 +351,7 @@ class TensorAllocator {
 };
 
 	
-Tensor *convertNVTETensorCheck(const NVTETensor t) {
+inline Tensor *convertNVTETensorCheck(const NVTETensor t) {
   Tensor *ptr = TensorAllocator::instance().convertNVTETensor(t);
   NVTE_CHECK(ptr != nullptr, "Invalid tensor.");
   return ptr;
@@ -625,4 +607,3 @@ __device__ inline void naive_topk_and_mask(T *scores, int data_size, int topk, i
   }
 }  // namespace transformer_engine
 #endif
-

@@ -78,6 +78,12 @@ enum NVTEScalingMode {
       rowwise or columnwise direction */
   NVTE_MXFP8_1D_SCALING = 1,
   NVTE_MTFP8_BLOCK_SCALING = 2,
+  /*! Hack unsupported: placeholder enum for upstream compatibility on MUSA. */
+  NVTE_BLOCK_SCALING_1D = 3,
+  /*! Hack unsupported: placeholder enum for upstream compatibility on MUSA. */
+  NVTE_BLOCK_SCALING_2D = 4,
+  /*! Hack unsupported: placeholder enum for upstream compatibility on MUSA. */
+  NVTE_NVFP4_1D_SCALING = 5,
   NVTE_INVALID_SCALING
 };
 
