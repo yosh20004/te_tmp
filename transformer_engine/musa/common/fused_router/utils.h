@@ -351,8 +351,12 @@ class TensorAllocator {
 };
 
 	
+inline Tensor *convertNVTETensor(const NVTETensor t) {
+  return reinterpret_cast<Tensor *>(t);
+}
+
 inline Tensor *convertNVTETensorCheck(const NVTETensor t) {
-  Tensor *ptr = TensorAllocator::instance().convertNVTETensor(t);
+  Tensor *ptr = convertNVTETensor(t);
   NVTE_CHECK(ptr != nullptr, "Invalid tensor.");
   return ptr;
 }

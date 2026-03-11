@@ -276,15 +276,24 @@ void fused_topk_with_score_function_forward(const Tensor logits, int num_tokens,
                                             Tensor intermediate_output, musaStream_t stream) {
   TE_ROUTER_PROBS_TYPE_SWITCH_ALL(
       logits.data.dtype, DataType,
-      TE_ROUTER_PROBS_TYPE_SWITCH_ALL(
-          expert_bias.data.dtype, BiasType,
-          fused_topk_with_score_function_forward_kernel_launcher<DataType, BiasType>(
-              reinterpret_cast<DataType *>(logits.data.dptr), num_tokens, num_experts, topk,
-              use_pre_softmax, num_groups, group_topk, scaling_factor, score_function,
-              reinterpret_cast<BiasType *>(expert_bias.data.dptr),
-              reinterpret_cast<DataType *>(probs.data.dptr),
-              reinterpret_cast<bool *>(routing_map.data.dptr),
-              reinterpret_cast<DataType *>(intermediate_output.data.dptr), stream);););
+      if (expert_bias.has_data()) {
+        TE_ROUTER_PROBS_TYPE_SWITCH_ALL(
+            expert_bias.data.dtype, BiasType,
+            fused_topk_with_score_function_forward_kernel_launcher<DataType, BiasType>(
+                reinterpret_cast<DataType *>(logits.data.dptr), num_tokens, num_experts, topk,
+                use_pre_softmax, num_groups, group_topk, scaling_factor, score_function,
+                reinterpret_cast<BiasType *>(expert_bias.data.dptr),
+                reinterpret_cast<DataType *>(probs.data.dptr),
+                reinterpret_cast<bool *>(routing_map.data.dptr),
+                reinterpret_cast<DataType *>(intermediate_output.data.dptr), stream););
+      } else {
+        fused_topk_with_score_function_forward_kernel_launcher<DataType, DataType>(
+            reinterpret_cast<DataType *>(logits.data.dptr), num_tokens, num_experts, topk,
+            use_pre_softmax, num_groups, group_topk, scaling_factor, score_function, nullptr,
+            reinterpret_cast<DataType *>(probs.data.dptr),
+            reinterpret_cast<bool *>(routing_map.data.dptr),
+            reinterpret_cast<DataType *>(intermediate_output.data.dptr), stream);
+      });
 }
 
 template <typename DataType>
@@ -484,11 +493,21 @@ void nvte_fused_topk_with_score_function_forward(
     NVTETensor intermediate_output, musaStream_t stream) {
   NVTE_API_CALL(nvte_fused_topk_with_score_function_forward);
   using namespace transformer_engine;
+  Tensor *logits_tensor = convertNVTETensor(logits);
+  NVTE_CHECK(logits_tensor != nullptr, "Invalid logits tensor.");
+  Tensor *expert_bias_tensor = convertNVTETensor(expert_bias);
+  Tensor *probs_tensor = convertNVTETensor(probs);
+  NVTE_CHECK(probs_tensor != nullptr, "Invalid probs tensor.");
+  Tensor *routing_map_tensor = convertNVTETensor(routing_map);
+  NVTE_CHECK(routing_map_tensor != nullptr, "Invalid routing_map tensor.");
+  Tensor *intermediate_output_tensor = convertNVTETensor(intermediate_output);
+  NVTE_CHECK(intermediate_output_tensor != nullptr, "Invalid intermediate_output tensor.");
+  Tensor empty_expert_bias;
   fused_topk_with_score_function_forward(
-      *convertNVTETensorCheck(logits), num_tokens, num_experts, topk,
+      *logits_tensor, num_tokens, num_experts, topk,
       static_cast<bool>(use_pre_softmax), num_groups, group_topk, scaling_factor, score_function,
-      *convertNVTETensorCheck(expert_bias), *convertNVTETensorCheck(probs),
-      *convertNVTETensorCheck(routing_map), *convertNVTETensorCheck(intermediate_output), stream);
+      expert_bias_tensor != nullptr ? *expert_bias_tensor : empty_expert_bias,
+      *probs_tensor, *routing_map_tensor, *intermediate_output_tensor, stream);
 }
 
 void nvte_fused_topk_with_score_function_backward(const NVTETensor routing_map,
@@ -505,4 +524,3 @@ void nvte_fused_topk_with_score_function_backward(const NVTETensor routing_map,
       static_cast<bool>(use_pre_softmax), scaling_factor, score_function,
       *convertNVTETensorCheck(grad_logits), stream);
 }
-
