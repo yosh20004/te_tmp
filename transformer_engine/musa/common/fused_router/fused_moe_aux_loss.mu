@@ -98,9 +98,9 @@ void fused_moe_aux_loss_forward_kernel_launcher(const DataType* probs,
     config.stream = stream;
 
     // Update the max cluster size based on the device
-    NVTE_CHECK_CUDA(musaOccupancyMaxPotentialClusterSize(
-        &cluster_size,
-        reinterpret_cast<void*>(fused_moe_aux_loss_forward_kernel<DataType, IndexType>), &config));
+    // NVTE_CHECK_CUDA(musaOccupancyMaxPotentialClusterSize(
+    //    &cluster_size,
+    //    reinterpret_cast<void*>(fused_moe_aux_loss_forward_kernel<DataType, IndexType>), &config));
 
     musaLaunchAttribute attribute[1];
     attribute[0].id = musaLaunchAttributeClusterDimension;

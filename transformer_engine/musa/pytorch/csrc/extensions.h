@@ -15,6 +15,8 @@
  * Router fusion
  **************************************************************************************************/
 
+namespace transformer_engine::pytorch {
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_topk_with_score_function_fwd(
     at::Tensor logits, int topk, bool use_pre_softmax, c10::optional<int> num_groups,
     c10::optional<int> group_topk, c10::optional<float> scaling_factor, std::string score_function,
@@ -42,6 +44,8 @@ std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd(at::Tensor probs,
 
 at::Tensor fused_moe_aux_loss_bwd(at::Tensor Const_buf, at::Tensor tokens_per_expert, int num_rows,
                                   int num_cols, at::Tensor grad_aux_loss);
+
+}  // namespace transformer_engine::pytorch
 
 /***************************************************************************************************
  * Permutation
