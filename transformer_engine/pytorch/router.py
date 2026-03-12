@@ -207,7 +207,7 @@ class FusedAuxLoss(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        probs: torch.Tensor,
+        routing_probs: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         total_num_tokens: int,
         num_experts: int,
@@ -215,10 +215,12 @@ class FusedAuxLoss(torch.autograd.Function):
         coeff: float,
     ):
         # pylint: disable=missing-function-docstring
-        num_rows = probs.size(0)
-        num_cols = probs.size(1)
+        num_rows = routing_probs.size(0)
+        num_cols = routing_probs.size(1)
+        # Pre-aggregate on the torch side for performance before launching the MUSA kernel.
+        aggregated_probs_per_expert = routing_probs.sum(dim=0)
         aux_loss, Const_buf = tex.fused_moe_aux_loss_fwd(
-            probs=probs,
+            aggregated_probs_per_expert=aggregated_probs_per_expert,
             tokens_per_expert=tokens_per_expert,
             total_num_tokens=total_num_tokens,
             num_experts=num_experts,
@@ -247,7 +249,7 @@ class FusedAuxLoss(torch.autograd.Function):
 
 
 def fused_moe_aux_loss(
-    probs: torch.Tensor,
+    routing_probs: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     total_num_tokens: int,
     num_experts: int,
@@ -258,7 +260,9 @@ def fused_moe_aux_loss(
     Fused MoE aux loss.
     Parameters
     ----------
-    probs : torch.Tensor
+    routing_probs : torch.Tensor
+        Per-token routing probabilities. They are reduced with ``sum(dim=0)`` on the torch side
+        for performance before the MUSA kernel is launched.
     tokens_per_expert : torch.Tensor
         the number of tokens per expert
     total_num_tokens : int
@@ -272,5 +276,6 @@ def fused_moe_aux_loss(
     -------
     aux_loss : torch.scalar
     """
-    return FusedAuxLoss.apply(probs, tokens_per_expert, total_num_tokens, num_experts, topk, coeff)
-
+    return FusedAuxLoss.apply(
+        routing_probs, tokens_per_expert, total_num_tokens, num_experts, topk, coeff
+    )

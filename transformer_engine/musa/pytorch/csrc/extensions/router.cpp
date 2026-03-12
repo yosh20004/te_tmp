@@ -141,7 +141,7 @@ at::Tensor fused_score_for_moe_aux_loss_bwd(int num_tokens, int num_experts,
   return grad_logits;
 }
 
-std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd(at::Tensor probs,
+std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd(at::Tensor aggregated_probs_per_expert,
                                                           at::Tensor tokens_per_expert,
                                                           int total_num_tokens, int num_experts,
                                                           int num_rows, int num_cols, int topk,
@@ -149,19 +149,23 @@ std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd(at::Tensor probs,
   TORCH_CHECK(topk > 0, "topk must be greater than 0");
   TORCH_CHECK(total_num_tokens > 0, "total_num_tokens must be greater than 0");
   TORCH_CHECK(num_experts > 0, "num_experts must be greater than 0");
+  TORCH_CHECK(aggregated_probs_per_expert.dim() == 1,
+              "fused_moe_aux_loss_fwd expects aggregated_probs_per_expert with shape [num_experts]");
+  TORCH_CHECK(aggregated_probs_per_expert.size(0) == num_cols,
+              "aggregated_probs_per_expert size must match num_cols");
 
   // Create the output tensor
-  at::Tensor aux_loss = at::empty({}, at::dtype(probs.scalar_type()).device(c10::DeviceType::PrivateUse1));
+  at::Tensor aux_loss = at::empty({}, at::dtype(aggregated_probs_per_expert.scalar_type()).device(c10::DeviceType::PrivateUse1));
   at::Tensor Const_buf = at::empty({}, at::dtype(at::kFloat).device(c10::DeviceType::PrivateUse1));
 
-  auto probs_cu = makeTransformerEngineTensor(probs);
+  auto aggregated_probs_per_expert_cu = makeTransformerEngineTensor(aggregated_probs_per_expert);
   auto tokens_per_expert_cu = makeTransformerEngineTensor(tokens_per_expert);
   auto aux_loss_cu = makeTransformerEngineTensor(aux_loss);
   auto Const_buf_cu = makeTransformerEngineTensor(Const_buf);
 
-  nvte_fused_moe_aux_loss_forward(probs_cu.data(), tokens_per_expert_cu.data(), total_num_tokens,
-                                  num_experts, num_rows, num_cols, topk, coeff, aux_loss_cu.data(),
-                                  Const_buf_cu.data(), at::musa::getCurrentMUSAStream());
+  nvte_fused_moe_aux_loss_forward(aggregated_probs_per_expert_cu.data(), tokens_per_expert_cu.data(),
+                                  total_num_tokens, num_experts, num_rows, num_cols, topk, coeff,
+                                  aux_loss_cu.data(), Const_buf_cu.data(), at::musa::getCurrentMUSAStream());
 
   return std::make_tuple(aux_loss, Const_buf);
 }

@@ -21,69 +21,59 @@ namespace transformer_engine {
 using CompType = double;
 
 template <typename DataType, typename IndexType>
-__global__ void fused_moe_aux_loss_forward_kernel(const DataType* probs,
+__global__ void fused_moe_aux_loss_forward_kernel(const DataType* aggregated_probs_per_expert,
                                                   const IndexType* tokens_per_expert,
                                                   int total_num_tokens, int num_experts,
                                                   int num_rows, int num_cols, int topk, float coeff,
                                                   DataType* aux_loss, float* Const_buf) {
-// Use Only 1 block/1024 threads to avoid the grid sync
-if (blockIdx.x > 0) return;
-int warp_num = blockDim.x / kThreadsPerWarp;
-int warp_id = threadIdx.x / kThreadsPerWarp;
-int lane_id = threadIdx.x % kThreadsPerWarp;
-extern __shared__ float shmem_aux_loss[];
-CompType* aggregated_probs_per_expert = reinterpret_cast<CompType*>(shmem_aux_loss);
+  // Use Only 1 block/1024 threads to avoid the grid sync
+  if (blockIdx.x > 0) return;
+  int warp_num = blockDim.x / kThreadsPerWarp;
+  int warp_id = threadIdx.x / kThreadsPerWarp;
+  int lane_id = threadIdx.x % kThreadsPerWarp;
+  extern __shared__ float shmem_aux_loss[];
+  CompType* aggregated_probs_per_expert_shmem = reinterpret_cast<CompType*>(shmem_aux_loss);
 
-// Clear the shmem
-for (int i = threadIdx.x; i < num_cols; i += blockDim.x) {
-  aggregated_probs_per_expert[i] = CompType(0);
-}
-__syncthreads();
+  (void)warp_num;
+  (void)num_rows;
 
-/**
-    * Section: Reduce the probs to the aggregated_probs_per_expert
-    */
-// Loop: for all positions in each row
-for (int i = lane_id; i < num_cols; i += kThreadsPerWarp) {
-  CompType tmp = CompType(0);
-  // Loop: for all rows that this warp is responsible for
-  for (int j = warp_id; j < num_rows; j += warp_num) {
-    tmp += CompType(probs[j * num_cols + i]);
+  // Load the pre-aggregated probabilities into shmem.
+  for (int i = threadIdx.x; i < num_cols; i += blockDim.x) {
+    aggregated_probs_per_expert_shmem[i] = CompType(aggregated_probs_per_expert[i]);
   }
-  atomicAdd(&aggregated_probs_per_expert[i], tmp);
-}
-__syncthreads();
+  __syncthreads();
 
-/**
-    * Section: aggregated_probs_per_expert * tokens_per_expert
-    * In-place update on shmem
-    */
-for (int i = threadIdx.x; i < num_cols; i += blockDim.x) {
-  aggregated_probs_per_expert[i] *= CompType(tokens_per_expert[i]);
-}
-__syncthreads();
-
-if (warp_id == 0) {
-  /**
-        * Section: Reduce to get the sum of aggregated_probs_per_expert
-        */
-  CompType intermediate_result =
-      warp_reduce_on_shmem(aggregated_probs_per_expert, num_cols, ReduceFuncType::SUM, lane_id);
-  __syncwarp();
-
-  if (lane_id == 0) {
-    /**
-            * Section: Compute the aux_loss
-            */
-    float C_coeff = (num_experts * coeff) / topk / total_num_tokens / total_num_tokens;
-    aux_loss[0] = static_cast<DataType>(static_cast<double>(intermediate_result) * C_coeff);
-    Const_buf[0] = C_coeff;
+  /*
+   * Section: aggregated_probs_per_expert * tokens_per_expert
+   * In-place update on shmem
+   */
+  for (int i = threadIdx.x; i < num_cols; i += blockDim.x) {
+    aggregated_probs_per_expert_shmem[i] *= CompType(tokens_per_expert[i]);
   }
-}
+  __syncthreads();
+
+  if (warp_id == 0) {
+    /*
+     * Section: Reduce to get the sum of aggregated_probs_per_expert
+     */
+    CompType intermediate_result =
+        warp_reduce_on_shmem(aggregated_probs_per_expert_shmem, num_cols, ReduceFuncType::SUM,
+                             lane_id);
+    __syncwarp();
+
+    if (lane_id == 0) {
+      /*
+       * Section: Compute the aux_loss
+       */
+      float C_coeff = (num_experts * coeff) / topk / total_num_tokens / total_num_tokens;
+      aux_loss[0] = static_cast<DataType>(static_cast<double>(intermediate_result) * C_coeff);
+      Const_buf[0] = C_coeff;
+    }
+  }
 }
 
 template <typename DataType, typename IndexType>
-void fused_moe_aux_loss_forward_kernel_launcher(const DataType* probs,
+void fused_moe_aux_loss_forward_kernel_launcher(const DataType* aggregated_probs_per_expert,
                                                 const IndexType* tokens_per_expert,
                                                 int total_num_tokens, int num_experts, int num_rows,
                                                 int num_cols, int topk, float coeff,
@@ -111,27 +101,30 @@ void fused_moe_aux_loss_forward_kernel_launcher(const DataType* probs,
     config.attrs = attribute;
 
     NVTE_CHECK_CUDA(musaLaunchKernelEx(
-        &config, fused_moe_aux_loss_forward_kernel<DataType, IndexType>, probs, tokens_per_expert,
-        total_num_tokens, num_experts, num_rows, num_cols, topk, coeff, aux_loss, Const_buf));
+        &config, fused_moe_aux_loss_forward_kernel<DataType, IndexType>,
+        aggregated_probs_per_expert, tokens_per_expert, total_num_tokens, num_experts, num_rows,
+        num_cols, topk, coeff, aux_loss, Const_buf));
   } else {
     size_t smem_size = sizeof(CompType) * num_cols;
     fused_moe_aux_loss_forward_kernel<DataType, IndexType>
-        <<<1, 1024, smem_size, stream>>>(probs, tokens_per_expert, total_num_tokens, num_experts,
-                                         num_rows, num_cols, topk, coeff, aux_loss, Const_buf);
+        <<<1, 1024, smem_size, stream>>>(aggregated_probs_per_expert, tokens_per_expert,
+                                         total_num_tokens, num_experts, num_rows, num_cols, topk,
+                                         coeff, aux_loss, Const_buf);
     NVTE_CHECK_CUDA(musaGetLastError());
   }
 }
 
-void fused_moe_aux_loss_forward(const Tensor& probs, const Tensor& tokens_per_expert,
-                                int total_num_tokens, int num_experts, int num_rows, int num_cols,
-                                int topk, float coeff, Tensor& aux_loss, Tensor& Const_buf,
+void fused_moe_aux_loss_forward(const Tensor& aggregated_probs_per_expert,
+                                const Tensor& tokens_per_expert, int total_num_tokens,
+                                int num_experts, int num_rows, int num_cols, int topk,
+                                float coeff, Tensor& aux_loss, Tensor& Const_buf,
                                 musaStream_t stream) {
   TE_ROUTER_PROBS_TYPE_SWITCH_ALL(
-      probs.data.dtype, DataType,
+      aggregated_probs_per_expert.data.dtype, DataType,
       TE_ROUTER_INDEX_TYPE_SWITCH_ALL(
           tokens_per_expert.data.dtype, IndexType,
           fused_moe_aux_loss_forward_kernel_launcher<DataType, IndexType>(
-              reinterpret_cast<DataType*>(probs.data.dptr),
+              reinterpret_cast<DataType*>(aggregated_probs_per_expert.data.dptr),
               reinterpret_cast<IndexType*>(tokens_per_expert.data.dptr), total_num_tokens,
               num_experts, num_rows, num_cols, topk, coeff,
               reinterpret_cast<DataType*>(aux_loss.data.dptr),
@@ -188,15 +181,17 @@ void fused_moe_aux_loss_backward(const Tensor& Const_buf, const Tensor& tokens_p
 
 }  // namespace transformer_engine
 
-void nvte_fused_moe_aux_loss_forward(const NVTETensor probs, const NVTETensor tokens_per_expert,
-                                     int total_num_tokens, int num_experts, int num_rows,
-                                     int num_cols, int topk, float coeff, NVTETensor aux_loss,
-                                     NVTETensor Const_buf, musaStream_t stream) {
+void nvte_fused_moe_aux_loss_forward(const NVTETensor aggregated_probs_per_expert,
+                                     const NVTETensor tokens_per_expert, int total_num_tokens,
+                                     int num_experts, int num_rows, int num_cols, int topk,
+                                     float coeff, NVTETensor aux_loss, NVTETensor Const_buf,
+                                     musaStream_t stream) {
   NVTE_API_CALL(nvte_fused_moe_aux_loss_forward);
   using namespace transformer_engine;
   fused_moe_aux_loss_forward(
-      *convertNVTETensorCheck(probs), *convertNVTETensorCheck(tokens_per_expert), total_num_tokens,
-      num_experts, num_rows, num_cols, topk, coeff, *convertNVTETensorCheck(aux_loss),
+      *convertNVTETensorCheck(aggregated_probs_per_expert),
+      *convertNVTETensorCheck(tokens_per_expert), total_num_tokens, num_experts, num_rows,
+      num_cols, topk, coeff, *convertNVTETensorCheck(aux_loss),
       *convertNVTETensorCheck(Const_buf), stream);
 }
 
@@ -211,4 +206,3 @@ void nvte_fused_moe_aux_loss_backward(const NVTETensor Const_buf,
                               *convertNVTETensorCheck(grad_aux_loss),
                               *convertNVTETensorCheck(grad_probs), stream);
 }
-

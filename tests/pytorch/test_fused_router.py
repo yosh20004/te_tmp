@@ -378,7 +378,7 @@ def test_fused_moe_aux_loss(dtype, num_tokens, num_experts, topk):
     )
 
     aux_loss_fused = fused_moe_aux_loss(
-        probs=probs_clone,
+        routing_probs=probs_clone,
         tokens_per_expert=tokens_per_expert,
         total_num_tokens=num_tokens,
         num_experts=num_experts,

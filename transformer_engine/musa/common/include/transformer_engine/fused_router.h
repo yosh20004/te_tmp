@@ -93,22 +93,23 @@ void nvte_fused_score_for_moe_aux_loss_backward(const NVTETensor intermediate_ou
 
 /*! \brief Forward pass for auxiliary loss.
  *
- *  \param[in]     probs           Probabilities from the forward pass.
+ *  \param[in]     aggregated_probs_per_expert  Aggregated probabilities summed across rows.
  *  \param[in]     tokens_per_expert  Number of tokens per expert.
  *  \param[in]     total_num_tokens   Number of total tokens. Will be used in seq/global aux loss.
  *  \param[in]     num_experts     Number of experts.
- *  \param[in]     num_rows        Number of rows of probs.
- *  \param[in]     num_cols        Number of columns of probs.
+ *  \param[in]     num_rows        Original number of rows of probs.
+ *  \param[in]     num_cols        Number of experts / columns.
  *  \param[in]     topk            Topk value.
  *  \param[in]     coeff           Coefficient.
  *  \param[out]    aux_loss        Output GPU scalar for auxiliary loss.
  *  \param[out]    Const_buf       Output GPU scalar for temporary constant buffer for backward pass.
  *  \param[in]     stream          CUDA stream used for the operation.
  */
-void nvte_fused_moe_aux_loss_forward(const NVTETensor probs, const NVTETensor tokens_per_expert,
-                                     int total_num_tokens, int num_experts, int num_rows,
-                                     int num_cols, int topk, float coeff, NVTETensor aux_loss,
-                                     NVTETensor Const_buf, musaStream_t stream);
+void nvte_fused_moe_aux_loss_forward(const NVTETensor aggregated_probs_per_expert,
+                                     const NVTETensor tokens_per_expert, int total_num_tokens,
+                                     int num_experts, int num_rows, int num_cols, int topk,
+                                     float coeff, NVTETensor aux_loss, NVTETensor Const_buf,
+                                     musaStream_t stream);
 
 /*! \brief Backward pass for auxiliary loss.
  *
@@ -130,4 +131,3 @@ void nvte_fused_moe_aux_loss_backward(const NVTETensor Const_buf,
 #endif
 
 #endif  // TRANSFORMER_ENGINE_FUSED_ROPE_H_
-
