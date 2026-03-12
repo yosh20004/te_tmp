@@ -358,7 +358,7 @@ def test_fused_moe_aux_loss_perf_against_torch(record_property):
         moe_aux_loss_coeff=coeff,
     )
     fused_loss = fused_moe_aux_loss(
-        routing_probs=probs,
+        probs=probs,
         tokens_per_expert=tokens_per_expert,
         total_num_tokens=num_tokens,
         num_experts=num_experts,
@@ -378,7 +378,7 @@ def test_fused_moe_aux_loss_perf_against_torch(record_property):
     )
     fused_ms = _benchmark_musa_kernel(
         lambda: fused_moe_aux_loss(
-            routing_probs=probs,
+            probs=probs,
             tokens_per_expert=tokens_per_expert,
             total_num_tokens=num_tokens,
             num_experts=num_experts,
