@@ -210,8 +210,8 @@ def test_fused_topk_router_perf_against_torch(
     _require_perf_env()
 
     dtype = torch.float32
-    num_tokens = 8192
-    num_experts = 128
+    num_tokens = 4096
+    num_experts = 192
     topk = 8
     num_groups = 8
     group_topk = 4
