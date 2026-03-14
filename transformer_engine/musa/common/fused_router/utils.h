@@ -365,7 +365,7 @@ inline Tensor *convertNVTETensorCheck(const NVTETensor t) {
 
 constexpr size_t kThreadsPerWarp = 32;
 constexpr int kThreadsPerBlock =
-    128;  // Using 4 warps in 1 CTA, Each warp is responsible for 1 token.
+    256;  // Using 8 warps in 1 CTA, each warp is responsible for 1 token.
 constexpr float epsilon = 1e-20;
 
 template <typename T>
@@ -500,10 +500,8 @@ __device__ inline void apply_softmax_bwd_on_float(DataType *grad, DataType *fwd_
 }
 
 template <typename DataType>
-__device__ inline void apply_softmax_on_float(DataType *scores, int data_size, int lane_id) {
-  // 1. compute the max of value
-  float max_val =
-      static_cast<float>(warp_reduce_on_shmem(scores, data_size, ReduceFuncType::MAX, lane_id));
+__device__ inline void apply_softmax_on_float_with_max(DataType *scores, int data_size, int lane_id,
+                                                       float max_val) {
   // 2. value -> exp_value
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
     scores[i] = static_cast<float>(exp(static_cast<float>(scores[i]) - max_val));
@@ -519,66 +517,163 @@ __device__ inline void apply_softmax_on_float(DataType *scores, int data_size, i
   __syncwarp();
 }
 
-template <typename T>
-__device__ inline void fast_topk_and_mask(T *scores, int data_size, int topk, int *topk_indices,
-                                          T *topk_scores, int lane_id) {
-  // Bit i indicates whether the i-th local element (lane_id + i * warp_size) was selected.
-  uint32_t local_mask = 0;
+template <typename DataType>
+__device__ inline void apply_softmax_on_float(DataType *scores, int data_size, int lane_id) {
+  // 1. compute the max of value
+  float max_val =
+      static_cast<float>(warp_reduce_on_shmem(scores, data_size, ReduceFuncType::MAX, lane_id));
+  apply_softmax_on_float_with_max(scores, data_size, lane_id, max_val);
+}
 
-  for (int k = 0; k < topk; k++) {
-    double local_max_val = -std::numeric_limits<double>::infinity();
-    int local_max_idx = -1;
+__device__ inline void insert_topk_desc(float val, int idx, float *vals, int *indices, int k) {
+  if (val <= vals[k - 1]) return;
+  int pos = k - 1;
+  while (pos > 0 && val > vals[pos - 1]) {
+    vals[pos] = vals[pos - 1];
+    indices[pos] = indices[pos - 1];
+    pos--;
+  }
+  vals[pos] = val;
+  indices[pos] = idx;
+}
 
-    // 1) Per-lane local max on unmasked elements.
-    int bit_idx = 0;
-    for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-      if (((local_mask >> bit_idx) & 1u) == 0u) {
-        double cur_val = static_cast<double>(scores[i]);
-        if (cur_val > local_max_val) {
-          local_max_val = cur_val;
-          local_max_idx = i;
-        }
-      }
-      bit_idx++;
+template <int K>
+__device__ inline void merge_topk_desc(const float (&a_vals)[K], const int (&a_indices)[K],
+                                       const float (&b_vals)[K], const int (&b_indices)[K],
+                                       float (&out_vals)[K], int (&out_indices)[K]) {
+  int ia = 0, ib = 0;
+#pragma unroll
+  for (int out = 0; out < K; ++out) {
+    float av = (ia < K) ? a_vals[ia] : -std::numeric_limits<float>::infinity();
+    float bv = (ib < K) ? b_vals[ib] : -std::numeric_limits<float>::infinity();
+    int ai = (ia < K) ? a_indices[ia] : INT_MAX;
+    int bi = (ib < K) ? b_indices[ib] : INT_MAX;
+    bool choose_a = (av > bv) || ((av == bv) && (ai < bi));
+    out_vals[out] = choose_a ? av : bv;
+    out_indices[out] = choose_a ? ai : bi;
+    ia += choose_a ? 1 : 0;
+    ib += choose_a ? 0 : 1;
+  }
+}
+
+template <typename T, int K>
+__device__ inline void warp_network_topk_and_mask(T *scores, int data_size, int *topk_indices,
+                                                  T *topk_scores, int lane_id) {
+  static_assert(K > 0, "K must be positive");
+  float vals[K];
+  int indices[K];
+#pragma unroll
+  for (int i = 0; i < K; ++i) {
+    vals[i] = -std::numeric_limits<float>::infinity();
+    indices[i] = -1;
+  }
+
+  // Per-lane local top-k.
+  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
+    float v = static_cast<float>(scores[i]);
+    insert_topk_desc(v, i, vals, indices, K);
+  }
+
+  // Warp all-reduce with top-k merge operator.
+  for (int offset = kThreadsPerWarp / 2; offset > 0; offset /= 2) {
+    float other_vals[K];
+    int other_indices[K];
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+      other_vals[j] = __shfl_xor_sync(0xffffffff, vals[j], offset);
+      other_indices[j] = __shfl_xor_sync(0xffffffff, indices[j], offset);
     }
-
-    // 2) Warp reduction to find global max and index.
-    double global_max_val = local_max_val;
-    int global_max_idx = local_max_idx;
-    for (int s = kThreadsPerWarp / 2; s > 0; s /= 2) {
-      double shuffled_val = __shfl_down_sync(0xffffffff, global_max_val, s);
-      int shuffled_idx = __shfl_down_sync(0xffffffff, global_max_idx, s);
-      if (shuffled_val > global_max_val) {
-        global_max_val = shuffled_val;
-        global_max_idx = shuffled_idx;
-      }
-    }
-    global_max_idx = __shfl_sync(0xffffffff, global_max_idx, 0);
-    global_max_val = __shfl_sync(0xffffffff, global_max_val, 0);
-
-    // 3) Write top-k result.
-    if (lane_id == 0) {
-      topk_indices[k] = global_max_idx;
-      topk_scores[k] = static_cast<T>(global_max_val);
-    }
-
-    // 4) Mark selected element in owning lane's local mask.
-    if (global_max_idx >= 0 && (global_max_idx % kThreadsPerWarp) == lane_id) {
-      int local_bit_pos = global_max_idx / kThreadsPerWarp;
-      if (local_bit_pos < 32) {
-        local_mask |= (1u << local_bit_pos);
-      }
+    float merged_vals[K];
+    int merged_indices[K];
+    merge_topk_desc<K>(vals, indices, other_vals, other_indices, merged_vals, merged_indices);
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+      vals[j] = merged_vals[j];
+      indices[j] = merged_indices[j];
     }
   }
 
-  // Keep a single sync point so call-sites can safely consume topk_* from all lanes.
+  if (lane_id == 0) {
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+      topk_indices[j] = indices[j];
+      topk_scores[j] = static_cast<T>(vals[j]);
+    }
+  }
   __syncwarp();
+}
+
+template <typename T>
+__device__ inline void generic_topk_and_mask(T *scores, int data_size, int topk, int *topk_indices,
+                                             T *topk_scores, int lane_id) {
+  auto is_masked = [&topk_indices](int k, int index) {
+    if (k == 0) return false;
+    for (int i = 0; i < k; i++) {
+      if (topk_indices[i] == index) return true;
+    }
+    return false;
+  };
+
+  for (int k = 0; k < topk; k++) {
+    float val = (lane_id < data_size && !is_masked(k, lane_id))
+                    ? static_cast<float>(scores[lane_id])
+                    : -std::numeric_limits<float>::infinity();
+    int index = (lane_id < data_size) ? lane_id : -1;
+    for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
+      float cur_val =
+          is_masked(k, i) ? -std::numeric_limits<float>::infinity() : static_cast<float>(scores[i]);
+      if (cur_val > val) {
+        val = cur_val;
+        index = i;
+      }
+    }
+    for (int s = kThreadsPerWarp / 2; s > 0; s /= 2) {
+      float shuffled_val = __shfl_xor_sync(0xffffffff, val, s);
+      int shuffled_index = __shfl_xor_sync(0xffffffff, index, s);
+      if (shuffled_val > val) {
+        val = shuffled_val;
+        index = shuffled_index;
+      }
+    }
+    if (lane_id == 0) {
+      topk_indices[k] = index;
+      topk_scores[k] = static_cast<T>(val);
+    }
+    __syncwarp();
+  }
+}
+
+template <typename T, int K>
+__device__ inline void naive_topk_and_mask_constexpr(T *scores, int data_size, int *topk_indices,
+                                                      T *topk_scores, int lane_id) {
+  static_assert(K > 0, "K must be positive");
+  if constexpr (K == 1 || K == 2 || K == 4 || K == 8) {
+    warp_network_topk_and_mask<T, K>(scores, data_size, topk_indices, topk_scores, lane_id);
+  } else {
+    generic_topk_and_mask(scores, data_size, K, topk_indices, topk_scores, lane_id);
+  }
 }
 
 template <typename T>
 __device__ inline void naive_topk_and_mask(T *scores, int data_size, int topk, int *topk_indices,
                                            T *topk_scores, int lane_id) {
-  fast_topk_and_mask(scores, data_size, topk, topk_indices, topk_scores, lane_id);
+  switch (topk) {
+    case 1:
+      naive_topk_and_mask_constexpr<T, 1>(scores, data_size, topk_indices, topk_scores, lane_id);
+      break;
+    case 2:
+      naive_topk_and_mask_constexpr<T, 2>(scores, data_size, topk_indices, topk_scores, lane_id);
+      break;
+    case 4:
+      naive_topk_and_mask_constexpr<T, 4>(scores, data_size, topk_indices, topk_scores, lane_id);
+      break;
+    case 8:
+      naive_topk_and_mask_constexpr<T, 8>(scores, data_size, topk_indices, topk_scores, lane_id);
+      break;
+    default:
+      generic_topk_and_mask(scores, data_size, topk, topk_indices, topk_scores, lane_id);
+      break;
+  }
 }
 
 // Current TE only support float32/bf16/fp16, float64 probs should be considered in the future
