@@ -188,12 +188,9 @@ __global__ void fused_score_for_moe_aux_loss_backward_kernel(const DataType *int
   // To store the output of softmax/sigmoid from the fwd
   DataType *act_from_fwd_buf =
       reinterpret_cast<DataType *>(grad_scores_buf + num_experts * num_token_per_block);
-  DataType *comp_buf =
-      reinterpret_cast<DataType *>(act_from_fwd_buf + num_experts * num_token_per_block);
   // The address of buffers on the current warp
   DataType *local_grad = grad_scores_buf + warp_id * num_experts;
   DataType *local_act_from_fwd = act_from_fwd_buf + warp_id * num_experts;
-  DataType *local_comp_buf = comp_buf + warp_id * num_experts;
 
   /***
      * Section: Main Loop
@@ -233,30 +230,26 @@ __global__ void fused_score_for_moe_aux_loss_backward_kernel(const DataType *int
          */
     // Sigmoid Post-processing bwd when topk > 1
     if (topk > 1 && score_function == 0) {
-      auto sum_fwd_input =
+      float sum_fwd_input =
           warp_reduce_on_shmem(local_act_from_fwd, num_experts, ReduceFuncType::SUM, lane_id);
-      // Put the result of output * grad to the comp_buf
+      float local_sum_output_x_grad = 0.0f;
       for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-        local_comp_buf[i] = local_grad[i] * local_act_from_fwd[i];
+        local_sum_output_x_grad +=
+            static_cast<float>(local_grad[i]) * static_cast<float>(local_act_from_fwd[i]);
       }
-      __syncwarp();
-      auto sum_Output_x_Grad =
-          warp_reduce_on_shmem(local_comp_buf, num_experts, ReduceFuncType::SUM, lane_id);
+      float sum_Output_x_Grad = warp_reduce_sum_float(local_sum_output_x_grad);
       // In-place update
       for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
+        float denom = sum_fwd_input + epsilon;
         local_grad[i] =
-            static_cast<double>(local_grad[i]) / (static_cast<double>(sum_fwd_input) + epsilon) -
-            static_cast<double>(sum_Output_x_Grad) /
-                ((static_cast<double>(sum_fwd_input) + epsilon) *
-                 (static_cast<double>(sum_fwd_input) + epsilon));
+            static_cast<float>(local_grad[i]) / denom - sum_Output_x_Grad / (denom * denom);
       }
     }
     __syncwarp();
 
     // Pre-softmax bwd
     if (score_function == 1) {
-      apply_softmax_bwd_on_float(local_grad, local_act_from_fwd, local_comp_buf, nullptr,
-                                 num_experts, lane_id);
+      apply_softmax_bwd_on_float(local_grad, local_act_from_fwd, nullptr, num_experts, lane_id);
       __syncwarp();
     }
     // Sigmoid bwd
@@ -281,8 +274,7 @@ void fused_score_for_moe_aux_loss_backward_kernel_launcher(
   size_t grid_size = (num_tokens + num_token_per_block - 1) / num_token_per_block;
   size_t shared_memory_size = num_experts * num_token_per_block * sizeof(DataType)  // grad_scores
                               +
-                              num_experts * num_token_per_block * sizeof(DataType)  // act_from_fwd
-                              + num_experts * num_token_per_block * sizeof(DataType);  // comp_buf
+                              num_experts * num_token_per_block * sizeof(DataType);  // act_from_fwd
   fused_score_for_moe_aux_loss_backward_kernel<DataType>
       <<<grid_size, kThreadsPerBlock, shared_memory_size, stream>>>(
           intermediate_output, grad_scores, num_tokens, num_experts, topk, score_function,
@@ -327,4 +319,3 @@ void nvte_fused_score_for_moe_aux_loss_backward(const NVTETensor intermediate_ou
       *convertNVTETensorCheck(intermediate_output), *convertNVTETensorCheck(grad_scores),
       num_tokens, num_experts, topk, score_function, *convertNVTETensorCheck(grad_logits), stream);
 }
-

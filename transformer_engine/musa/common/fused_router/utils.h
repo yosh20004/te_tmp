@@ -383,35 +383,38 @@ enum ReduceFuncType {
   MAX,
 };
 
+__device__ inline float warp_reduce_sum_float(float val) {
+  for (int offset = kThreadsPerWarp / 2; offset > 0; offset /= 2) {
+    val += __shfl_down_sync(0xffffffff, val, offset);
+  }
+  return __shfl_sync(0xffffffff, val, 0);
+}
+
+__device__ inline float warp_reduce_max_float(float val) {
+  for (int offset = kThreadsPerWarp / 2; offset > 0; offset /= 2) {
+    float other = __shfl_down_sync(0xffffffff, val, offset);
+    val = val > other ? val : other;
+  }
+  return __shfl_sync(0xffffffff, val, 0);
+}
+
 template <typename T>
 __device__ inline T warp_reduce_on_shmem(T *data_ptr, int data_size, ReduceFuncType type,
                                          int lane_id) {
-  T (*reduce_func)(T, T);
-  double default_val = 0;
   if (type == ReduceFuncType::SUM) {
-    reduce_func = sum;
-    default_val = 0;
-  } else if (type == ReduceFuncType::MAX) {
-    reduce_func = max;
-    default_val = -std::numeric_limits<double>::infinity();
+    float local_val = 0.0f;
+    for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
+      local_val += static_cast<float>(data_ptr[i]);
+    }
+    return static_cast<T>(warp_reduce_sum_float(local_val));
   }
 
-  // Some value is hanlded in local thread
-  // Thread 0 is responsible for the: 0-th, 32-th, 64-th, 96-th ...
-  // Reduce the value in local thread
-  volatile double val = lane_id < data_size ? static_cast<double>(data_ptr[lane_id]) : default_val;
-  for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
-    val = reduce_func(val, data_ptr[i]);
+  float local_val = -std::numeric_limits<float>::infinity();
+  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
+    float cur = static_cast<float>(data_ptr[i]);
+    local_val = local_val > cur ? local_val : cur;
   }
-
-  // Warp shuffle between threads
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 16));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 8));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 4));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 2));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 1));
-  __syncwarp();
-  return T(val);
+  return static_cast<T>(warp_reduce_max_float(local_val));
 }
 
 template <typename DataType>
@@ -424,35 +427,21 @@ __device__ inline void apply_sigmoid_on_float(DataType *scores, int data_size, i
 template <typename T>
 __device__ inline T masked_warp_reduce_on_shmem(T *data_ptr, bool *mask, int data_size,
                                                 ReduceFuncType type, int lane_id) {
-  T (*reduce_func)(T, T);
-  double default_val = 0;
   if (type == ReduceFuncType::SUM) {
-    reduce_func = sum;
-    default_val = 0;
-  } else if (type == ReduceFuncType::MAX) {
-    reduce_func = max;
-    default_val = -std::numeric_limits<double>::infinity();
-  }
-
-  // Some value is hanlded in local thread
-  // Thread 0 is responsible for the: 0-th, 32-th, 64-th, 96-th ...
-  // Reduce the value in local thread
-  volatile double val =
-      lane_id < data_size && mask[lane_id] ? static_cast<double>(data_ptr[lane_id]) : default_val;
-  for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
-    if (mask[i]) {
-      val = reduce_func(val, data_ptr[i]);
+    float local_val = 0.0f;
+    for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
+      if (mask[i]) local_val += static_cast<float>(data_ptr[i]);
     }
+    return static_cast<T>(warp_reduce_sum_float(local_val));
   }
 
-  // Warp shuffle between threads
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 16));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 8));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 4));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 2));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 1));
-  __syncwarp();
-  return T(val);
+  float local_val = -std::numeric_limits<float>::infinity();
+  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
+    if (!mask[i]) continue;
+    float cur = static_cast<float>(data_ptr[i]);
+    local_val = local_val > cur ? local_val : cur;
+  }
+  return static_cast<T>(warp_reduce_max_float(local_val));
 }
 
 template <typename DataType>
@@ -466,24 +455,15 @@ __device__ inline void apply_sigmoid_bwd_on_float(DataType *grad, DataType *fwd_
 
 template <typename DataType>
 __device__ inline void apply_softmax_bwd_on_float(DataType *grad, DataType *fwd_output,
-                                                  DataType *comp_buf, bool *mask, int data_size,
-                                                  int lane_id) {
-  // Put the result of output * grad to the comp_buf
+                                                  bool *mask, int data_size, int lane_id) {
+  // Accumulate sum(output * grad) directly in registers, avoid shmem ping-pong.
+  float local_sum = 0.0f;
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    if (mask) {
-      if (mask[i])
-        comp_buf[i] = static_cast<float>(grad[i]) * static_cast<float>(fwd_output[i]);
-      else
-        comp_buf[i] = 0.0f;
-    } else {
-      comp_buf[i] = static_cast<float>(grad[i]) * static_cast<float>(fwd_output[i]);
+    if (!mask || mask[i]) {
+      local_sum += static_cast<float>(grad[i]) * static_cast<float>(fwd_output[i]);
     }
   }
-  __syncwarp();
-  float sum_Output_x_Grad = warp_reduce_on_shmem(
-      /*data ptr = */ comp_buf,
-      /*data size = */ data_size,
-      /*reduce func = */ ReduceFuncType::SUM, lane_id);
+  float sum_Output_x_Grad = warp_reduce_sum_float(local_sum);
   // In-place update
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
     if (mask) {
@@ -643,6 +623,105 @@ __device__ inline void generic_topk_and_mask(T *scores, int data_size, int topk,
   }
 }
 
+__device__ inline bool is_group_selected(int group_id, const int *selected_groups, int group_topk) {
+  for (int i = 0; i < group_topk; ++i) {
+    if (selected_groups[i] == group_id) return true;
+  }
+  return false;
+}
+
+template <typename T, int K>
+__device__ inline void warp_network_topk_and_mask_group_filtered(
+    T *scores, int data_size, int group_size, const int *selected_groups, int group_topk,
+    int *topk_indices, T *topk_scores, int lane_id) {
+  static_assert(K > 0, "K must be positive");
+  float vals[K];
+  int indices[K];
+#pragma unroll
+  for (int i = 0; i < K; ++i) {
+    vals[i] = -std::numeric_limits<float>::infinity();
+    indices[i] = -1;
+  }
+
+  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
+    int group_id = i / group_size;
+    if (!is_group_selected(group_id, selected_groups, group_topk)) continue;
+    insert_topk_desc(static_cast<float>(scores[i]), i, vals, indices, K);
+  }
+
+  for (int offset = kThreadsPerWarp / 2; offset > 0; offset /= 2) {
+    float other_vals[K];
+    int other_indices[K];
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+      other_vals[j] = __shfl_xor_sync(0xffffffff, vals[j], offset);
+      other_indices[j] = __shfl_xor_sync(0xffffffff, indices[j], offset);
+    }
+    float merged_vals[K];
+    int merged_indices[K];
+    merge_topk_desc<K>(vals, indices, other_vals, other_indices, merged_vals, merged_indices);
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+      vals[j] = merged_vals[j];
+      indices[j] = merged_indices[j];
+    }
+  }
+
+  if (lane_id == 0) {
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+      topk_indices[j] = indices[j];
+      topk_scores[j] = static_cast<T>(vals[j]);
+    }
+  }
+  __syncwarp();
+}
+
+template <typename T>
+__device__ inline void generic_topk_and_mask_group_filtered(
+    T *scores, int data_size, int topk, int group_size, const int *selected_groups, int group_topk,
+    int *topk_indices, T *topk_scores, int lane_id) {
+  auto is_masked = [&topk_indices](int k, int index) {
+    if (k == 0) return false;
+    for (int i = 0; i < k; ++i) {
+      if (topk_indices[i] == index) return true;
+    }
+    return false;
+  };
+
+  for (int k = 0; k < topk; ++k) {
+    float val = -std::numeric_limits<float>::infinity();
+    int index = -1;
+    for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
+      if (is_masked(k, i)) continue;
+      int group_id = i / group_size;
+      if (!is_group_selected(group_id, selected_groups, group_topk)) continue;
+      float cur_val = static_cast<float>(scores[i]);
+      if ((cur_val > val) || ((cur_val == val) && (index < 0 || i < index))) {
+        val = cur_val;
+        index = i;
+      }
+    }
+    for (int s = kThreadsPerWarp / 2; s > 0; s /= 2) {
+      float shuffled_val = __shfl_xor_sync(0xffffffff, val, s);
+      int shuffled_index = __shfl_xor_sync(0xffffffff, index, s);
+      bool take_shuffled =
+          (shuffled_val > val) ||
+          ((shuffled_val == val) && (shuffled_index >= 0) &&
+           ((index < 0) || (shuffled_index < index)));
+      if (take_shuffled) {
+        val = shuffled_val;
+        index = shuffled_index;
+      }
+    }
+    if (lane_id == 0) {
+      topk_indices[k] = index;
+      topk_scores[k] = static_cast<T>(val);
+    }
+    __syncwarp();
+  }
+}
+
 template <typename T, int K>
 __device__ inline void naive_topk_and_mask_constexpr(T *scores, int data_size, int *topk_indices,
                                                       T *topk_scores, int lane_id) {
@@ -651,6 +730,53 @@ __device__ inline void naive_topk_and_mask_constexpr(T *scores, int data_size, i
     warp_network_topk_and_mask<T, K>(scores, data_size, topk_indices, topk_scores, lane_id);
   } else {
     generic_topk_and_mask(scores, data_size, K, topk_indices, topk_scores, lane_id);
+  }
+}
+
+template <typename T, int K>
+__device__ inline void naive_topk_and_mask_group_filtered_constexpr(
+    T *scores, int data_size, int group_size, const int *selected_groups, int group_topk,
+    int *topk_indices, T *topk_scores, int lane_id) {
+  static_assert(K > 0, "K must be positive");
+  if constexpr (K == 1 || K == 2 || K == 4 || K == 8) {
+    warp_network_topk_and_mask_group_filtered<T, K>(
+        scores, data_size, group_size, selected_groups, group_topk, topk_indices, topk_scores,
+        lane_id);
+  } else {
+    generic_topk_and_mask_group_filtered(scores, data_size, K, group_size, selected_groups,
+                                         group_topk, topk_indices, topk_scores, lane_id);
+  }
+}
+
+template <typename T>
+__device__ inline void naive_topk_and_mask_group_filtered(
+    T *scores, int data_size, int topk, int group_size, const int *selected_groups, int group_topk,
+    int *topk_indices, T *topk_scores, int lane_id) {
+  switch (topk) {
+    case 1:
+      naive_topk_and_mask_group_filtered_constexpr<T, 1>(
+          scores, data_size, group_size, selected_groups, group_topk, topk_indices, topk_scores,
+          lane_id);
+      break;
+    case 2:
+      naive_topk_and_mask_group_filtered_constexpr<T, 2>(
+          scores, data_size, group_size, selected_groups, group_topk, topk_indices, topk_scores,
+          lane_id);
+      break;
+    case 4:
+      naive_topk_and_mask_group_filtered_constexpr<T, 4>(
+          scores, data_size, group_size, selected_groups, group_topk, topk_indices, topk_scores,
+          lane_id);
+      break;
+    case 8:
+      naive_topk_and_mask_group_filtered_constexpr<T, 8>(
+          scores, data_size, group_size, selected_groups, group_topk, topk_indices, topk_scores,
+          lane_id);
+      break;
+    default:
+      generic_topk_and_mask_group_filtered(scores, data_size, topk, group_size, selected_groups,
+                                           group_topk, topk_indices, topk_scores, lane_id);
+      break;
   }
 }
 

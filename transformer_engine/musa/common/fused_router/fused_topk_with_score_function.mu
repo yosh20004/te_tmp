@@ -56,23 +56,23 @@ __global__ void fused_topk_with_score_function_forward_kernel(
   DataType *scores_buf = reinterpret_cast<DataType *>(shmem);
   DataType *topk_scores_buf =
       reinterpret_cast<DataType *>(scores_buf + num_experts_v * num_token_per_block);
-  DataType *group_scores_buf = nullptr, *masked_scores_buf = nullptr;
-  int *topk_indices_buf = nullptr;
+  DataType *group_scores_buf = nullptr;
+  int *selected_groups_buf = nullptr, *topk_indices_buf = nullptr;
   if (group_topk_v > 0) {
-    masked_scores_buf = reinterpret_cast<DataType *>(topk_scores_buf + topk_v * num_token_per_block);
-    group_scores_buf =
-        reinterpret_cast<DataType *>(masked_scores_buf + num_experts_v * num_token_per_block);
-    topk_indices_buf = reinterpret_cast<int *>(group_scores_buf + num_groups_v * num_token_per_block);
+    group_scores_buf = reinterpret_cast<DataType *>(topk_scores_buf + topk_v * num_token_per_block);
+    selected_groups_buf =
+        reinterpret_cast<int *>(group_scores_buf + num_groups_v * num_token_per_block);
+    topk_indices_buf = selected_groups_buf + topk_v * num_token_per_block;
   } else {
     topk_indices_buf = reinterpret_cast<int *>(topk_scores_buf + topk_v * num_token_per_block);
   }
   // The address of buffers on the current warp
   DataType *scores = scores_buf + warp_id * num_experts_v;
   DataType *topk_scores = topk_scores_buf + warp_id * topk_v;
-  DataType *masked_scores =
-      (group_topk_v > 0) ? (masked_scores_buf + warp_id * num_experts_v) : nullptr;
   DataType *group_scores =
       (group_topk_v > 0) ? (group_scores_buf + warp_id * num_groups_v) : nullptr;
+  int *selected_groups =
+      (group_topk_v > 0) ? (selected_groups_buf + warp_id * topk_v) : nullptr;
   int *topk_indices = topk_indices_buf + warp_id * topk_v;
 
   /***
@@ -133,12 +133,6 @@ __global__ void fused_topk_with_score_function_forward_kernel(
         pre_softmax_max = shuffled_max > pre_softmax_max ? shuffled_max : pre_softmax_max;
       }
       pre_softmax_max = __shfl_sync(0xffffffff, pre_softmax_max, 0);
-    }
-    // If group_topk > 0, init the masked_scores to -inf
-    if (group_topk_v > 0) {
-      for (int i = lane_id; i < num_experts_v; i += kThreadsPerWarp) {
-        masked_scores[i] = -std::numeric_limits<DataType>::infinity();
-      }
     }
     __syncwarp();
 
@@ -250,21 +244,19 @@ __global__ void fused_topk_with_score_function_forward_kernel(
             /*lane id = */ lane_id);
       }
       __syncwarp();
-      // Copy the unmasked scores to the buffer
-      for (int i = 0; i < group_topk_v; i++) {
-        int st = topk_indices[i] * group_size;
-        int ed = st + group_size;
-        for (int j = st + lane_id; j < ed; j += kThreadsPerWarp) {
-          masked_scores[j] = scores[j];
-        }
+      // Persist selected groups and directly do final topk on original scores with group filter.
+      for (int i = lane_id; i < group_topk_v; i += kThreadsPerWarp) {
+        selected_groups[i] = topk_indices[i];
       }
       __syncwarp();
       if constexpr (kFixedTopK) {
-        naive_topk_and_mask_constexpr<DataType, kTopKConst>(
-            masked_scores, num_experts_v, topk_indices, topk_scores, lane_id);
+        naive_topk_and_mask_group_filtered_constexpr<DataType, kTopKConst>(
+            scores, num_experts_v, group_size, selected_groups, group_topk_v, topk_indices,
+            topk_scores, lane_id);
       } else {
-        naive_topk_and_mask(
-            masked_scores, num_experts_v, topk_v, topk_indices, topk_scores, lane_id);
+        naive_topk_and_mask_group_filtered(
+            scores, num_experts_v, topk_v, group_size, selected_groups, group_topk_v, topk_indices,
+            topk_scores, lane_id);
       }
 
     } else {
@@ -343,8 +335,8 @@ void fused_topk_with_score_function_forward_kernel_launcher(
                               + topk * num_token_per_block * sizeof(DataType)       // topk_scores
                               + topk * num_token_per_block * sizeof(int);           // topk_indices
   if (group_topk > 0) {
-    shared_memory_size += num_groups * num_token_per_block * sizeof(DataType);   // group_scores
-    shared_memory_size += num_experts * num_token_per_block * sizeof(DataType);  // maksed_scores
+    shared_memory_size += num_groups * num_token_per_block * sizeof(DataType);  // group_scores
+    shared_memory_size += topk * num_token_per_block * sizeof(int);             // selected_groups
   }
 
 #define TE_LAUNCH_FUSED_TOPK_FWD(NUM_EXPERTS_C, TOPK_C, NUM_GROUPS_C, GROUP_TOPK_C)                \
@@ -466,14 +458,12 @@ __global__ void fused_topk_with_score_function_backward_kernel(
   // To store the output of softmax/sigmoid from the fwd
   DataType *act_from_fwd_buf =
       reinterpret_cast<DataType *>(grad_probs_buf + num_experts * num_token_per_block);
-  DataType *comp_buf =
-      reinterpret_cast<DataType *>(act_from_fwd_buf + num_experts * num_token_per_block);
   // To store the routing_map from the fwd
-  bool *routing_map_buf = reinterpret_cast<bool *>(comp_buf + num_experts * num_token_per_block);
+  bool *routing_map_buf =
+      reinterpret_cast<bool *>(act_from_fwd_buf + num_experts * num_token_per_block);
   // The address of buffers on the current warp
   DataType *local_grad = grad_probs_buf + warp_id * num_experts;
   DataType *local_act_from_fwd = act_from_fwd_buf + warp_id * num_experts;
-  DataType *local_comp_buf = comp_buf + warp_id * num_experts;
   bool *local_routing_map = routing_map_buf + warp_id * num_experts;
 
   /***
@@ -494,9 +484,45 @@ __global__ void fused_topk_with_score_function_backward_kernel(
          */
     int pos_offset = token_offset_cur_warp * num_experts;
     // Load the dgrad/output_from_fwd to shmem
+    if constexpr (std::is_same<DataType, float>::value) {
+      if ((num_experts & 3) == 0) {
+        const float4 *grad_probs_vec = reinterpret_cast<const float4 *>(grad_probs + pos_offset);
+        const float4 *act_from_fwd_vec =
+            reinterpret_cast<const float4 *>(intermediate_output + pos_offset);
+        float4 *local_grad_vec = reinterpret_cast<float4 *>(local_grad);
+        float4 *local_act_from_fwd_vec = reinterpret_cast<float4 *>(local_act_from_fwd);
+#pragma unroll
+        for (int i = lane_id; i < (num_experts / 4); i += kThreadsPerWarp) {
+          local_grad_vec[i] = grad_probs_vec[i];
+          local_act_from_fwd_vec[i] = act_from_fwd_vec[i];
+        }
+      } else if ((num_experts & 1) == 0) {
+        const float2 *grad_probs_vec = reinterpret_cast<const float2 *>(grad_probs + pos_offset);
+        const float2 *act_from_fwd_vec =
+            reinterpret_cast<const float2 *>(intermediate_output + pos_offset);
+        float2 *local_grad_vec = reinterpret_cast<float2 *>(local_grad);
+        float2 *local_act_from_fwd_vec = reinterpret_cast<float2 *>(local_act_from_fwd);
+#pragma unroll
+        for (int i = lane_id; i < (num_experts / 2); i += kThreadsPerWarp) {
+          local_grad_vec[i] = grad_probs_vec[i];
+          local_act_from_fwd_vec[i] = act_from_fwd_vec[i];
+        }
+      } else {
+#pragma unroll
+        for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
+          local_grad[i] = grad_probs[pos_offset + i];
+          local_act_from_fwd[i] = intermediate_output[pos_offset + i];
+        }
+      }
+    } else {
+#pragma unroll
+      for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
+        local_grad[i] = grad_probs[pos_offset + i];
+        local_act_from_fwd[i] = intermediate_output[pos_offset + i];
+      }
+    }
+#pragma unroll
     for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-      local_grad[i] = grad_probs[pos_offset + i];
-      local_act_from_fwd[i] = intermediate_output[pos_offset + i];
       local_routing_map[i] = routing_map[pos_offset + i];
     }
     __syncwarp();
@@ -517,29 +543,25 @@ __global__ void fused_topk_with_score_function_backward_kernel(
     __syncwarp();
     // Sigmoid Post-processing bwd when topk > 1
     if (topk > 1 && score_function == 0) {
-      double sum_fwd_input = masked_warp_reduce_on_shmem(
+      float sum_fwd_input = masked_warp_reduce_on_shmem(
           /*data ptr = */ local_act_from_fwd,
           /*mask ptr = */ local_routing_map,
           /*data size = */ num_experts,
           /*reduce func = */ ReduceFuncType::SUM, lane_id);
-      // Put the result of output * grad to the comp_buf
+      float local_sum_output_x_grad = 0.0f;
       for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-        local_comp_buf[i] = (local_routing_map[i] ? static_cast<double>(local_grad[i]) *
-                                                        static_cast<double>(local_act_from_fwd[i])
-                                                  : 0.0f);
+        if (local_routing_map[i]) {
+          local_sum_output_x_grad +=
+              static_cast<float>(local_grad[i]) * static_cast<float>(local_act_from_fwd[i]);
+        }
       }
-      __syncwarp();
-      double sum_Output_x_Grad = masked_warp_reduce_on_shmem(
-          /*data ptr = */ local_comp_buf,
-          /*mask ptr = */ local_routing_map,
-          /*data size = */ num_experts,
-          /*reduce func = */ ReduceFuncType::SUM, lane_id);
+      float sum_Output_x_Grad = warp_reduce_sum_float(local_sum_output_x_grad);
       // In-place update
       for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
         if (local_routing_map[i]) {
-          local_grad[i] =
-              static_cast<double>(local_grad[i]) / (sum_fwd_input + epsilon) -
-              sum_Output_x_Grad / ((sum_fwd_input + epsilon) * (sum_fwd_input + epsilon));
+          float denom = sum_fwd_input + epsilon;
+          local_grad[i] = static_cast<float>(local_grad[i]) / denom -
+                          sum_Output_x_Grad / (denom * denom);
         } else {
           local_grad[i] = 0.0f;
         }
@@ -548,8 +570,8 @@ __global__ void fused_topk_with_score_function_backward_kernel(
     __syncwarp();
     // Softmax bwd if use_pre_softmax is false
     if (!use_pre_softmax && score_function == 1) {
-      apply_softmax_bwd_on_float(local_grad, local_act_from_fwd, local_comp_buf, local_routing_map,
-                                 num_experts, lane_id);
+      apply_softmax_bwd_on_float(local_grad, local_act_from_fwd, local_routing_map, num_experts,
+                                 lane_id);
       __syncwarp();
     }
 
@@ -572,8 +594,7 @@ __global__ void fused_topk_with_score_function_backward_kernel(
          */
     // Pre-softmax bwd
     if constexpr (score_function == 1 && use_pre_softmax) {
-      apply_softmax_bwd_on_float(local_grad, local_act_from_fwd, local_comp_buf, nullptr,
-                                 num_experts, lane_id);
+      apply_softmax_bwd_on_float(local_grad, local_act_from_fwd, nullptr, num_experts, lane_id);
       __syncwarp();
     }
     // Sigmoid bwd
@@ -621,7 +642,6 @@ void fused_topk_with_score_function_backward_kernel_launcher(
   size_t shared_memory_size = num_experts * num_token_per_block * sizeof(DataType)  // grad_probs
                               +
                               num_experts * num_token_per_block * sizeof(DataType)  // act_from_fwd
-                              + num_experts * num_token_per_block * sizeof(DataType)  // comp_buf
                               + num_experts * num_token_per_block * sizeof(bool);     // routing_map
 
   if (score_function == 0 && use_pre_softmax == false)
